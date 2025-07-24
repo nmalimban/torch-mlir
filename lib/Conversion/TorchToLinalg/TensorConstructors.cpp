@@ -116,6 +116,83 @@ public:
 
 namespace {
 
+class ConvertAtenReplicationPad1dOp
+    : public OpConversionPattern<AtenReplicationPad1dOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(AtenReplicationPad1dOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
+      return failure();
+
+    Location loc = op.getLoc();
+    Value input = adaptor.getSelf();
+    auto inputType = llvm::cast<RankedTensorType>(input.getType());
+    int64_t inputRank = inputType.getRank();
+
+    if (inputRank < 2)
+      return rewriter.notifyMatchFailure(op, "input rank must be at least 2");
+
+    SmallVector<int64_t> padInts;
+    if (!matchPattern(op.getPadding(), m_TorchListOfConstantInts(padInts)))
+      return rewriter.notifyMatchFailure(
+          op, "only support constant int pad ranges");
+
+    if (padInts.size() != 2)
+      return rewriter.notifyMatchFailure(
+          op, "pad range must have exactly two values");
+
+    int64_t leftPad = padInts[0];
+    int64_t rightPad = padInts[1];
+
+    int64_t dimToPad = inputRank - 1;
+    Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+
+    SmallVector<Value> inputShape = getTensorSizes(rewriter, loc, input);
+    Value widthSize = inputShape[dimToPad];
+    Value widthMinusOne = rewriter.create<arith::SubIOp>(loc, widthSize, one);
+
+    // Build offset and size arrays for slicing
+    SmallVector<OpFoldResult> allOneStrides(inputRank,
+                                            rewriter.getIndexAttr(1));
+    SmallVector<OpFoldResult> leftOffsets(inputRank, rewriter.getIndexAttr(0));
+    SmallVector<OpFoldResult> rightOffsets(inputRank, rewriter.getIndexAttr(0));
+    SmallVector<OpFoldResult> sizes(inputRank, rewriter.getIndexAttr(0));
+    for (int i = 0; i < inputRank; ++i)
+      sizes[i] = (i == dimToPad) ? rewriter.getIndexAttr(1)
+                                 : getAsOpFoldResult(inputShape[i]);
+
+    rightOffsets[dimToPad] = getAsOpFoldResult(widthMinusOne);
+
+    // Extract leftmost and rightmost slices
+    Value leftSlice = rewriter.create<tensor::ExtractSliceOp>(
+        loc, input, leftOffsets, sizes, allOneStrides);
+    Value rightSlice = rewriter.create<tensor::ExtractSliceOp>(
+        loc, input, rightOffsets, sizes, allOneStrides);
+
+    // Aggregate slices to concat together
+    SmallVector<Value> resultParts;
+    resultParts.reserve(leftPad + rightPad + 1);
+
+    resultParts.append(leftPad, leftSlice);
+    resultParts.push_back(input);
+    resultParts.append(rightPad, rightSlice);
+
+    Value result =
+        rewriter.create<tensor::ConcatOp>(loc, dimToPad, resultParts);
+    Type resultType = getTypeConverter()->convertType(op.getType());
+    rewriter.replaceOpWithNewOp<tensor::CastOp>(op, resultType, result);
+
+    return success();
+  }
+};
+
+} // namespace
+
+namespace {
+
 // Lower aten.replication_pad2d operator into a sequence of
 // tensor.extract_slice and tensor.concat operations.
 
@@ -349,6 +426,107 @@ public:
 };
 } // namespace
 
+namespace {
+
+// Lower aten.replication_pad3d operator into a sequence of
+// tensor.extract_slice and tensor.concat operations.
+class ConvertAtenReplicationPad3dOp
+    : public OpConversionPattern<AtenReplicationPad3dOp> {
+
+private:
+  enum sliceLoc { START = 0, END = 1 };
+
+  Value extractSlice(ConversionPatternRewriter &rewriter, Location loc,
+                     Value input, int64_t dimension, sliceLoc sliceLoc) const {
+    auto inputType = llvm::cast<RankedTensorType>(input.getType());
+    int64_t inputRank = inputType.getRank();
+    SmallVector<Value> inputShape = getTensorSizes(rewriter, loc, input);
+
+    SmallVector<OpFoldResult> offsets(inputRank, rewriter.getIndexAttr(0));
+    if (sliceLoc == END) {
+      Value dimSize = inputShape[dimension];
+      Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+      Value endIdx = rewriter.create<arith::SubIOp>(loc, dimSize, one);
+      offsets[dimension] = getAsOpFoldResult(endIdx);
+    }
+
+    SmallVector<OpFoldResult> allOneStrides(inputRank,
+                                            rewriter.getIndexAttr(1));
+    SmallVector<OpFoldResult> sizes(inputRank, rewriter.getIndexAttr(0));
+    for (int i = 0; i < inputRank; ++i)
+      sizes[i] = (i == dimension) ? rewriter.getIndexAttr(1)
+                                  : getAsOpFoldResult(inputShape[i]);
+
+    Value extractedSlice = rewriter.create<tensor::ExtractSliceOp>(
+        loc, input, offsets, sizes, allOneStrides);
+    return extractedSlice;
+  }
+
+  Value createTile(ConversionPatternRewriter &rewriter, Location loc,
+                   Value slice, int64_t tileWidth, int64_t dimension) const {
+    SmallVector<Value> slices(tileWidth, slice);
+    if (tileWidth == 1)
+      return slice;
+    return rewriter.create<tensor::ConcatOp>(loc, dimension, slices);
+  }
+
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(AtenReplicationPad3dOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
+      return failure();
+
+    Location loc = op->getLoc();
+    Value input = adaptor.getSelf();
+    auto inputType = llvm::cast<RankedTensorType>(input.getType());
+    int64_t inputRank = inputType.getRank();
+    unsigned numDims = inputType.getRank();
+    assert(numDims >= 2 && "Not enough input dimensions");
+
+    SmallVector<int64_t> padInts;
+    if (!matchPattern(op.getPadding(), m_TorchListOfConstantInts(padInts)))
+      return rewriter.notifyMatchFailure(
+          op, "only support constant int pad ranges");
+
+    if (padInts.size() != 6)
+      return rewriter.notifyMatchFailure(
+          op, "pad range must have exactly six values");
+
+    Value res = input;
+    int64_t padIdx = 0;
+    for (int64_t dim = inputRank - 1; dim >= inputRank - 3; dim--) {
+      int64_t startTileWidth = padInts[padIdx++];
+      int64_t endTileWidth = padInts[padIdx++];
+
+      SmallVector<Value> resultParts;
+      if (startTileWidth > 0) {
+        Value slice = extractSlice(rewriter, loc, res, dim, sliceLoc::START);
+        Value tile = createTile(rewriter, loc, slice, startTileWidth, dim);
+        resultParts.push_back(tile);
+      }
+
+      resultParts.push_back(res);
+
+      if (endTileWidth > 0) {
+        Value slice = extractSlice(rewriter, loc, res, dim, sliceLoc::END);
+        Value tile = createTile(rewriter, loc, slice, endTileWidth, dim);
+        resultParts.push_back(tile);
+      }
+
+      if (resultParts.size() > 1)
+        res = rewriter.create<tensor::ConcatOp>(loc, dim, resultParts);
+    }
+
+    Type resultType = getTypeConverter()->convertType(op.getType());
+    rewriter.replaceOpWithNewOp<tensor::CastOp>(op, resultType, res);
+    return success();
+  }
+};
+
+} // namespace
 namespace {
 // Converts constant tensor allocation like ops.
 template <typename OpTy, int fillVal>
@@ -619,8 +797,12 @@ void mlir::torch::torch_to_linalg::
                                                   RewritePatternSet &patterns,
                                                   ConversionTarget &target) {
   MLIRContext *context = patterns.getContext();
+  target.addIllegalOp<AtenReplicationPad3dOp>();
+  patterns.add<ConvertAtenReplicationPad3dOp>(typeConverter, context);
   target.addIllegalOp<AtenReplicationPad2dOp>();
   patterns.add<ConvertAtenReplicationPad2dOp>(typeConverter, context);
+  target.addIllegalOp<AtenReplicationPad1dOp>();
+  patterns.add<ConvertAtenReplicationPad1dOp>(typeConverter, context);
   target.addIllegalOp<AtenConstantPadNdOp>();
   patterns.add<ConvertAtenConstantPadNdOp>(typeConverter, context);
   target.addIllegalOp<AtenZerosOp, AtenOnesOp>();
